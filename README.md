@@ -9,6 +9,8 @@
 
 **[Открыть case study →](https://jefo.github.io/sales-report-bot/)**
 
+<img src="docs/screens/sales-report-bot/04.png" alt="Форма отчёта за смену" width="360" />
+
 ---
 
 ## Что это
