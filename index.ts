@@ -1,0 +1,503 @@
+import { TelegramClient } from "@bot-machine/telegram-client";
+import * as Views from "./src/views/sales-bot-views";
+
+// --- Simple In-Memory State ---
+interface ConversationState {
+    step: string;
+    messageId?: number;        // ID of the main form message
+    inputMessageId?: number;   // ID of the input instruction message
+    reportData?: any;
+    photosUploaded?: number;
+    editingField?: string; // Field being edited (for inline editing)
+}
+const conversationStates = new Map<number, ConversationState>();
+
+const BOT_TOKEN = process.env.BOT_TOKEN;
+if (!BOT_TOKEN) {
+    console.error("BOT_TOKEN is not set!");
+    process.exit(1);
+}
+
+const client = new TelegramClient(BOT_TOKEN);
+let offset = 0;
+
+console.log("Sales Bot Demo started...");
+
+const mainLoop = async () => {
+    while (true) {
+        try {
+            const updates = await client.getUpdates({ offset, timeout: 30 });
+
+            for (const update of updates) {
+                offset = update.update_id + 1;
+                const message = update.message || update.callback_query?.message;
+                const chatId = message?.chat.id;
+                if (!chatId) continue;
+
+                const state = conversationStates.get(chatId) || { step: "START" };
+
+                // --- Text Message Handler ---
+                if (update.message?.text) {
+                    const text = update.message.text;
+                    console.log(`[${chatId}] Text: ${text}`);
+
+                    if (text.startsWith("/start")) {
+                        conversationStates.delete(chatId);
+                        await Views.showRoleSelectionMenu(client, chatId);
+                        continue;
+                    }
+
+                    
+                    
+                    // --- Handle editing mode (works in REPORT_FORM step when editingField is set) ---
+                    if (state.editingField) {
+                        const reportData = state.reportData || {};
+                        
+                        // Validate that the input is a number
+                        const numberValue = parseFloat(text.replace(/[^\d.,-]/g, ''));
+                        if (isNaN(numberValue) || numberValue < 0) {
+                            await client.sendMessage({
+                                chat_id: chatId,
+                                text: "❌ Пожалуйста, введите корректное числовое значение (только цифры и десятичный разделитель)."
+                            });
+                            
+                            // Delete the old form message
+                            if (state.messageId) {
+                                try {
+                                    await client.deleteMessage({ 
+                                        chat_id: chatId, 
+                                        message_id: state.messageId 
+                                    });
+                                } catch (e) {
+                                    // Message might not exist or already be deleted, ignore error
+                                }
+                            }
+                            
+                            // Show the form with editing instructions again at the top
+                            const updatedFormMessage = await Views.showReportForm(client, chatId, undefined, reportData, state.editingField);
+                            
+                            // Resend input instruction
+                            let fieldPrompt = "";
+                            if (state.editingField === "revenue") fieldPrompt = "общую сумму выручки";
+                            else if (state.editingField === "cash") fieldPrompt = "наличные";
+                            else if (state.editingField === "card") fieldPrompt = "безналичный расчет";
+                            else if (state.editingField === "qr") fieldPrompt = "оплату по QR-коду";
+                            else if (state.editingField === "transfer") fieldPrompt = "переводом";
+                            else if (state.editingField === "returns") fieldPrompt = "возвраты";
+                            
+                            // Delete the previous input instruction message if exists
+                            if (state.inputMessageId) {
+                                try {
+                                    await client.deleteMessage({ 
+                                        chat_id: chatId, 
+                                        message_id: state.inputMessageId 
+                                    });
+                                } catch (e) {
+                                    // Message might not exist or already be deleted, ignore error
+                                }
+                            }
+                            
+                            // Determine the icon for the field
+                            let fieldIcon = "";
+                            if (state.editingField === "revenue") fieldIcon = "💰";
+                            else if (state.editingField === "cash") fieldIcon = "💵";
+                            else if (state.editingField === "card") fieldIcon = "💳";
+                            else if (state.editingField === "qr") fieldIcon = "📱";
+                            else if (state.editingField === "transfer") fieldIcon = "🔄";
+                            else if (state.editingField === "returns") fieldIcon = "↩️";
+                            
+                            // Send new input instruction message with icon
+                            const inputMessage = await client.sendMessage({
+                                chat_id: chatId,
+                                text: `${fieldIcon} Введите сумму для поля "${fieldPrompt}":`
+                            });
+                            
+                            // Update state with all new values
+                            conversationStates.set(chatId, { 
+                                ...state, 
+                                messageId: updatedFormMessage.message_id,
+                                inputMessageId: inputMessage.message_id,
+                                reportData: reportData
+                            });
+                            continue; // Skip further processing and wait for new input
+                        }
+                        
+                        // Update the specific field
+                        reportData[state.editingField] = numberValue;
+                        
+                        // Send confirmation message for the entered value
+                        let fieldLabel = "";
+                        if (state.editingField === "revenue") fieldLabel = "Общая выручка";
+                        else if (state.editingField === "cash") fieldLabel = "Наличные";
+                        else if (state.editingField === "card") fieldLabel = "Безналичный расчет";
+                        else if (state.editingField === "qr") fieldLabel = "Оплата по QR-коду";
+                        else if (state.editingField === "transfer") fieldLabel = "Переводом";
+                        else if (state.editingField === "returns") fieldLabel = "Возвраты";
+                        
+                        await client.sendMessage({
+                            chat_id: chatId,
+                            text: `✅ ${fieldLabel}: ${numberValue.toLocaleString('ru-RU')} руб.`
+                        });
+                        
+                        // Clear the editing field state but keep in REPORT_FORM step
+                        conversationStates.set(chatId, { 
+                            ...state, 
+                            reportData,
+                            editingField: undefined
+                        });
+                        
+                        console.log(`[${chatId}] Updated report data:`, reportData);
+                        
+                        // Delete the old form message
+                        if (state.messageId) {
+                            try {
+                                await client.deleteMessage({ 
+                                    chat_id: chatId, 
+                                    message_id: state.messageId 
+                                });
+                            } catch (e) {
+                                // Message might not exist or already be deleted, ignore error
+                            }
+                        }
+                        
+                        // Find next field to edit (the first one that is not filled)
+                        let nextField = null;
+                        if (reportData.cash === undefined) nextField = "cash";
+                        else if (reportData.card === undefined) nextField = "card";
+                        else if (reportData.qr === undefined) nextField = "qr";
+                        else if (reportData.transfer === undefined) nextField = "transfer";
+                        else if (reportData.returns === undefined) nextField = "returns";
+                        
+                        // Delete the old form message
+                        if (state.messageId) {
+                            try {
+                                await client.deleteMessage({ 
+                                    chat_id: chatId, 
+                                    message_id: state.messageId 
+                                });
+                            } catch (e) {
+                                // Message might not exist or already be deleted, ignore error
+                            }
+                        }
+                        
+                        // Show the updated report form at the top
+                        const updatedFormMessage = await Views.showReportForm(client, chatId, undefined, reportData, nextField ? nextField : undefined);
+                        
+                        // Delete the previous input instruction message if exists
+                        if (state.inputMessageId) {
+                            try {
+                                await client.deleteMessage({ 
+                                    chat_id: chatId, 
+                                    message_id: state.inputMessageId 
+                                });
+                            } catch (e) {
+                                // Message might not exist or already be deleted, ignore error
+                            }
+                        }
+                        
+                        if (nextField) {
+                            // Determine the icon for the field
+                            let fieldIcon = "";
+                            if (nextField === "revenue") fieldIcon = "💰";
+                            else if (nextField === "cash") fieldIcon = "💵";
+                            else if (nextField === "card") fieldIcon = "💳";
+                            else if (nextField === "qr") fieldIcon = "📱";
+                            else if (nextField === "transfer") fieldIcon = "🔄";
+                            else if (nextField === "returns") fieldIcon = "↩️";
+                            
+                            // Send new input instruction message with icon
+                            let fieldPrompt = "";
+                            if (nextField === "revenue") fieldPrompt = "общую сумму выручки";
+                            else if (nextField === "cash") fieldPrompt = "наличные";
+                            else if (nextField === "card") fieldPrompt = "безналичный расчет";
+                            else if (nextField === "qr") fieldPrompt = "оплату по QR-коду";
+                            else if (nextField === "transfer") fieldPrompt = "переводом";
+                            else if (nextField === "returns") fieldPrompt = "возвраты";
+                            
+                            const inputMessage = await client.sendMessage({
+                                chat_id: chatId,
+                                text: `${fieldIcon} Введите сумму для поля "${fieldPrompt}":`
+                            });
+                            
+                            // Update state with all new values and set next field to edit
+                            conversationStates.set(chatId, { 
+                                ...state, 
+                                messageId: updatedFormMessage.message_id,
+                                editingField: nextField,
+                                inputMessageId: inputMessage.message_id,
+                                reportData: reportData
+                            });
+                        } else {
+                            // All fields are filled, no need for input message
+                            conversationStates.set(chatId, { 
+                                ...state, 
+                                messageId: updatedFormMessage.message_id,
+                                editingField: undefined,
+                                inputMessageId: undefined,
+                                reportData: reportData
+                            });
+                        }
+                        continue;
+                    }
+                    // Handle REPORT_FORM step
+                    else if (state.step === "REPORT_FORM") {
+                        // If we're in REPORT_FORM but not in editing mode, text messages should be ignored
+                        if (!state.editingField) {
+                            console.log(`[${chatId}] Text message ignored in REPORT_FORM state (not editing)`);
+                        }
+                        continue; // Skip text processing in this state, wait for callback or editing mode
+                    }
+                    // Handle EMERGENCY_CLOSE step
+                    else if (state.step === "EMERGENCY_CLOSE") {
+                        // Validate that the input is a number
+                        const numberValue = parseFloat(text.replace(/[^\d.,-]/g, ''));
+                        if (isNaN(numberValue) || numberValue < 0) {
+                            await client.sendMessage({
+                                chat_id: chatId,
+                                text: "❌ Пожалуйста, введите корректное неотрицательное числовое значение для выручки при экстренном закрытии."
+                            });
+                            await client.sendMessage({
+                                chat_id: chatId,
+                                text: "Введите актуальную сумму выручки на момент экстренного закрытия:"
+                            });
+                            continue; // Skip further processing and wait for new input
+                        }
+                        
+                        // Process emergency close with the provided revenue
+                        await Views.showShiftEndMessage(client, chatId, state.messageId!);
+                        console.log(`[${chatId}] Emergency closure with revenue: ${numberValue}`);
+                        conversationStates.delete(chatId);
+                        continue;
+                    }
+                    // Handle REPORT_SUMMARY step (for backward compatibility)
+                    else if (state.step === "REPORT_SUMMARY") {
+                        // If we're in REPORT_SUMMARY but not in editing mode, text messages should be ignored
+                        if (!state.editingField) {
+                            console.log(`[${chatId}] Text message ignored in REPORT_SUMMARY state (not editing)`);
+                        }
+                        continue; // Skip text processing in this state, wait for callback or editing mode
+                    }
+                }
+
+                // --- Photo Handler ---
+                else if (update.message?.photo) {
+                    if (state.step === "AWAITING_PHOTOS") {
+                        const currentUploadedCount = (state.photosUploaded || 0);
+                        const newUploadedCount = currentUploadedCount + 1;
+                        console.log(`[${chatId}] Received photo ${newUploadedCount}/4`);
+                        
+                        if (newUploadedCount < 4) {
+                            conversationStates.set(chatId, { ...state, photosUploaded: newUploadedCount });
+                            // Send a NEW message for the next photo prompt
+                            await Views.askForPhotos(client, chatId, undefined, newUploadedCount);
+                        } else { // All 4 photos uploaded
+                            conversationStates.set(chatId, { ...state, step: "REPORT_REVIEW", photosUploaded: newUploadedCount });
+                            // Send a NEW message for the report review
+                            await Views.showReportReview(client, chatId, undefined, state.reportData);
+                        }
+                    }
+                }
+
+                // --- Callback Query Handler ---
+                else if (update.callback_query) {
+                    const data = update.callback_query.data ?? "";
+                    const messageId = update.callback_query.message?.message_id;
+                    console.log(`[${chatId}] Callback: ${data}`);
+
+                    // Update messageId for current conversation
+                    conversationStates.set(chatId, { ...state, messageId });
+
+                    if (data === "back_to_seller_menu") await Views.showSellerMenu(client, chatId, messageId);
+                    else if (data === "back_to_supervisor_menu") await Views.showSupervisorMenu(client, chatId, messageId);
+                    else if (data === "back_to_manager_menu") await Views.showManagerMenu(client, chatId, messageId);
+                    else if (data === "seller_start_shift") await Views.showStoreSelection(client, chatId, messageId);
+                    else if (data === "seller_my_stats") await Views.showSellerMyStats(client, chatId, messageId);
+                    else if (data === "seller_monthly_archive") await Views.showSellerMonthlyArchive(client, chatId, undefined);
+                    else if (data.startsWith("select_store_")) {
+                        const storeName = "Mock Store"; // In real life, we'd look this up
+                        conversationStates.set(chatId, { ...state, step: "ON_SHIFT" });
+                        await Views.showActiveShiftMenu(client, chatId, storeName, messageId);
+                    }
+                    else if (data === "seller_end_shift") {
+                        // Initialize the report form with an empty report
+                        const initialReportData = {
+                            revenue: undefined, // For future use if needed
+                            cash: undefined,
+                            card: undefined,
+                            qr: undefined,
+                            transfer: undefined,
+                            returns: undefined
+                        };
+                        
+                        // Show the empty form
+                        const formMessage = await Views.showReportForm(client, chatId, messageId, initialReportData, "card");
+                        
+                        // Send first input instruction - for the card field with icon
+                        const inputMessage = await client.sendMessage({
+                            chat_id: chatId,
+                            text: '💳 Введите сумму для поля "безналичный расчет":'
+                        });
+                        
+                        // Update state completely
+                        conversationStates.set(chatId, { 
+                            step: "REPORT_FORM", 
+                            messageId: formMessage.message_id,
+                            inputMessageId: inputMessage.message_id,
+                            reportData: initialReportData,
+                            editingField: "card"
+                        });
+                    }
+                    else if (data === "report_confirm") {
+                        console.log(`[${chatId}] Report confirmed:`, state.reportData);
+                        await Views.showShiftEndMessage(client, chatId, undefined); // Send new message
+                        conversationStates.delete(chatId);
+                    }
+                    else if (data === "report_edit") {
+                        // Restart the report flow
+                        conversationStates.set(chatId, { ...state, step: "AWAITING_REVENUE", photosUploaded: 0, reportData: {} });
+                        await Views.askForRevenue(client, chatId, undefined); // Send new message
+                    }
+                    else if (data === "report_form_confirm") {
+                        // After confirming the form, proceed to photo uploads
+                        await Views.askForPhotos(client, chatId, undefined, 0);
+                        conversationStates.set(chatId, {
+                            ...state,
+                            step: "AWAITING_PHOTOS",
+                            photosUploaded: 0,
+                        });
+                    }
+                    // Handle inline editing requests for REPORT_FORM
+                    else if (data.startsWith("edit_")) {
+                        // Extract field to edit (e.g., "edit_revenue", "edit_cash", etc.)
+                        const fieldToEdit = data.substring(5); // Remove "edit_" prefix
+                        
+                        // Set the editing field in state
+                        conversationStates.set(chatId, { 
+                            ...state, 
+                            editingField: fieldToEdit 
+                        });
+                        
+                        console.log(`[${chatId}] Setting editing field: ${fieldToEdit}, state:`, conversationStates.get(chatId));
+                        
+                        // Delete the old form message
+                        if (state.messageId) {
+                            try {
+                                await client.deleteMessage({ 
+                                    chat_id: chatId, 
+                                    message_id: state.messageId 
+                                });
+                            } catch (e) {
+                                // Message might not exist or already be deleted, ignore error
+                            }
+                        }
+                        
+                        // Show updated form at the top
+                        const updatedFormMessage = await Views.showReportForm(client, chatId, undefined, state.reportData, fieldToEdit);
+                        
+                        // Send or update the input instruction message
+                        let fieldPrompt = "";
+                        if (fieldToEdit === "revenue") fieldPrompt = "общую сумму выручки";
+                        else if (fieldToEdit === "cash") fieldPrompt = "наличные";
+                        else if (fieldToEdit === "card") fieldPrompt = "безналичный расчет";
+                        else if (fieldToEdit === "qr") fieldPrompt = "оплату по QR-коду";
+                        else if (fieldToEdit === "transfer") fieldPrompt = "переводом";
+                        else if (fieldToEdit === "returns") fieldPrompt = "возвраты";
+                        
+                        // Delete the previous input instruction message if exists
+                        if (state.inputMessageId) {
+                            try {
+                                await client.deleteMessage({ 
+                                    chat_id: chatId, 
+                                    message_id: state.inputMessageId 
+                                });
+                            } catch (e) {
+                                // Message might not exist or already be deleted, ignore error
+                            }
+                        }
+                        
+                        // Determine the icon for the field
+                        let fieldIcon = "";
+                        if (fieldToEdit === "revenue") fieldIcon = "💰";
+                        else if (fieldToEdit === "cash") fieldIcon = "💵";
+                        else if (fieldToEdit === "card") fieldIcon = "💳";
+                        else if (fieldToEdit === "qr") fieldIcon = "📱";
+                        else if (fieldToEdit === "transfer") fieldIcon = "🔄";
+                        else if (fieldToEdit === "returns") fieldIcon = "↩️";
+                        
+                        // Send new input instruction message with icon
+                        const inputMessage = await client.sendMessage({
+                            chat_id: chatId,
+                            text: `${fieldIcon} Введите сумму для поля "${fieldPrompt}":`
+                        });
+                        
+                        // Update state with all new values
+                        conversationStates.set(chatId, { 
+                            ...state, 
+                            messageId: updatedFormMessage.message_id,
+                            editingField: fieldToEdit,
+                            inputMessageId: inputMessage.message_id
+                        });
+                    }
+                    else if (data === "seller_emergency_close") {
+                        // For emergency close, we'll use a simplified flow
+                        conversationStates.set(chatId, { ...state, step: "EMERGENCY_CLOSE" });
+                        await client.sendMessage({
+                            chat_id: chatId,
+                            text: "Введите актуальную сумму выручки на момент экстренного закрытия:"
+                        });
+                    }
+                    else if (data === "sup_store_stats") await Views.showSupervisorStoreStats(client, chatId, messageId);
+                    else if (data === "sup_seller_stats") await Views.showSupervisorSellerStats(client, chatId, messageId);
+                    else if (data === "man_store_stats") await Views.showManagerStoreStats(client, chatId, messageId);
+                    else if (data === "man_seller_stats") await Views.showManagerSellerStats(client, chatId, messageId);
+                    else if (data === "role_seller") {
+                        await Views.showSellerMenu(client, chatId, messageId);
+                    }
+                    else if (data === "role_supervisor") {
+                        await Views.showSupervisorMenu(client, chatId, messageId);
+                    }
+                    else if (data === "role_manager") {
+                        await Views.showManagerMenu(client, chatId, messageId);
+                    }
+                    else if (data === "seller_work_materials") {
+                        await Views.showWorkMaterialsMenu(client, chatId, messageId, 'seller');
+                    }
+                    else if (data === "sup_work_materials") {
+                        await Views.showWorkMaterialsMenu(client, chatId, messageId, 'supervisor');
+                    }
+                    else if (data === "man_work_materials") {
+                        await Views.showWorkMaterialsMenu(client, chatId, messageId, 'manager');
+                    }
+                    // Handle category-specific callbacks for each role
+                    else if (data.startsWith("work_materials_regulations_")) {
+                        const role = data.split("_")[3] as 'seller' | 'supervisor' | 'manager';
+                        await Views.showWorkMaterialsByCategory(client, chatId, "regulations", role, messageId);
+                    }
+                    else if (data.startsWith("work_materials_info_")) {
+                        const role = data.split("_")[3] as 'seller' | 'supervisor' | 'manager';
+                        await Views.showWorkMaterialsByCategory(client, chatId, "materials", role, messageId);
+                    }
+                    else if (data.startsWith("work_materials_scripts_")) {
+                        const role = data.split("_")[3] as 'seller' | 'supervisor' | 'manager';
+                        await Views.showWorkMaterialsByCategory(client, chatId, "scripts", role, messageId);
+                    }
+                    // Handle returning to work materials menu
+                    else if (data.startsWith("work_materials_menu_")) {
+                        const role = data.split("_")[3] as 'seller' | 'supervisor' | 'manager';
+                        await Views.showWorkMaterialsMenu(client, chatId, messageId, role);
+                    }
+                    else if (data.includes("_materials")) {
+                        await Views.showInDevelopment(client, update.callback_query.id);
+                    }
+
+                    await client.answerCallbackQuery({ callback_query_id: update.callback_query.id });
+                }
+            }
+        } catch (error) {
+            console.error("Critical error in main loop:", error);
+            await new Promise(resolve => setTimeout(resolve, 5000)); // Prevent fast crash loop
+        }
+    }
+};
+
+mainLoop();
